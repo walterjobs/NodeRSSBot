@@ -32,6 +32,10 @@
             "description": "Telegram Bot Token from @BotFather",
             "required": true
         },
+        "TELEGRAM_API_BASE": {
+            "description": "Telegram API Base URL",
+            "required": false
+        },
         "DATABASE_URL": {
             "description": "connection string of other c/s dbms",
             "required": false
@@ -61,12 +65,17 @@
             "required": false
         },
         "RSSBOT_UA": {
-            "description": "user-agent header of the bot , version in default value is fetch from pacakge.json",
+            "description": "user-agent header of the bot , version in default value is fetch from package.json",
             "required": false
         },
         "RSSBOT_CONCURRENCY": {
             "value": "200",
             "description": "how many concurrency requests will be send in a batch",
+            "required": false
+        },
+        "RSSBOT_DB_POOL_MAX": {
+            "value": "15",
+            "description": "maximum PostgreSQL connections used by each process-local knex pool",
             "required": false
         },
         "PROXY_PROTOCOL": {
@@ -92,7 +101,7 @@
             "required": false
         },
         "RSSBOT_ALLOW_LIST": {
-            "description": "allow list by user id splited by comma. You can get your userid by @userinfobot or @getidsbot",
+            "description": "allow list by user id split by comma. You can get your userid by @userinfobot or @getidsbot",
             "required": false
         }
     }

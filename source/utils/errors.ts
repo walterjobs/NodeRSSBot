@@ -4,9 +4,19 @@ import { config } from '../config';
 
 export class ControllableError extends Error {
     code: string;
-    constructor(err: string, code: string) {
-        super(err);
+    override cause?: unknown;
+    constructor(err: unknown, code: string) {
+        super(
+            typeof err === 'string'
+                ? err
+                : err instanceof Error
+                  ? err.message
+                  : err === undefined
+                    ? ''
+                    : String(err)
+        );
         this.code = code;
+        this.cause = err;
         if (err) {
             if (code === 'DB_ERROR') {
                 logDBError(err);
@@ -24,7 +34,6 @@ export class ControllableError extends Error {
     }
 }
 
-// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
 export function newCtrlErr(code: string, e?: any): Error {
     if (e && e.response) {
         switch (e.response.statusCode) {

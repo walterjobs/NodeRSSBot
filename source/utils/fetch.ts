@@ -1,54 +1,219 @@
-import * as path from 'path';
+import cleanStack from '@cjsa/clean-stack';
+import * as Sentry from '@sentry/node';
+import fastQueue from 'fastq';
 import got from '../utils/got';
-import { DiskFastq } from 'disk-fastq';
 import { RecurrenceRule, scheduleJob } from 'node-schedule';
+
 import logger, { logHttpError } from './logger';
 import { findFeed, getNewItems } from './feed';
 import { config } from '../config';
 import { Feed, FeedItem } from '../types/feed';
 import { Optional, Option, isNone, none, isSome } from '../types/option';
-import { parseString } from '../parser/parse';
+import { nextFetchTimeStr } from './next-fetch-time';
+import { parseString, TRSS } from '../parser/parse';
 import {
     getAllFeeds,
     updateHashList,
     failAttempt,
-    getFeedByUrl,
     updateFeed,
-    handleRedirect,
-    updateFeedUrl
+    handleRedirect
 } from '../proxies/rss-feed';
 import {
-    Messager,
+    Messenger,
     SuccessMessage,
     ErrorMaxTimeMessage,
     ChangeFeedUrlMessage
 } from '../types/message';
 import { encodeUrl } from './urlencode';
-const { notify_error_count, item_num, concurrency, fetch_gap } = config;
+import { db } from '../database';
 
-function nextFetchTimeStr(minutes: number) {
-    // use SQLite CURRENT_TIMESTAMP return format like `2021-03-09 06:23:43`
-    // It should use the UTC timezone
-    return new Date(Date.now() + minutes * 60 * 1000)
-        .toISOString()
-        .split('.')[0]
-        .replace('T', ' ');
+type QueueResult = FeedItem[] | undefined;
+type QueueCallback = (err?: Error | null, result?: QueueResult) => void;
+type ErrorLike = {
+    cause?: unknown;
+    message?: string;
+    name?: string;
+    stack?: string;
+};
+
+const { notify_error_count, item_num, concurrency, fetch_gap, db_pool_max } =
+    config;
+
+export function getEffectiveConcurrency(
+    configuredConcurrency: number,
+    dbPoolMax: number
+): number {
+    return Math.min(configuredConcurrency, Math.max(1, dbPoolMax - 2));
 }
 
-function gotBugWorkaround(req) {
-    req.prependOnceListener('cacheableResponse', (cacheableResponse) => {
-        const fix = () => {
-            if (!cacheableResponse.req) {
-                return;
+export const effectiveConcurrency = getEffectiveConcurrency(
+    concurrency,
+    db_pool_max
+);
+
+const inQueueSet = new Set<number>();
+let isFetchingRound = false;
+let lastDueFeedCount = 0;
+let lastScheduledFeedCount = 0;
+let lastDuplicateSkippedFeedCount = 0;
+
+function serializeError(error: unknown): string | unknown {
+    if (error instanceof Error && error.stack) {
+        return cleanStack(error.stack);
+    }
+    if (error && typeof error === 'object' && 'stack' in error) {
+        const stack = (error as ErrorLike).stack;
+        if (stack) {
+            return cleanStack(stack);
+        }
+    }
+    return error;
+}
+
+function getKnexTimeoutError(error: unknown): ErrorLike | undefined {
+    const seen = new Set<unknown>();
+    let current: unknown = error;
+
+    while (current && typeof current === 'object' && !seen.has(current)) {
+        seen.add(current);
+        const currentError = current as ErrorLike;
+        if (
+            currentError.name === 'KnexTimeoutError' ||
+            currentError.message?.includes(
+                'Knex: Timeout acquiring a connection'
+            )
+        ) {
+            return currentError;
+        }
+        current = currentError.cause;
+    }
+
+    return undefined;
+}
+
+function getKnexPoolStats():
+    | {
+          used?: number;
+          free?: number;
+          pendingAcquires?: number;
+          pendingCreates?: number;
+      }
+    | undefined {
+    const pool = (db.client as { pool?: Record<string, unknown> }).pool;
+    if (!pool) {
+        return undefined;
+    }
+    const readMetric = (name: string): number | undefined => {
+        const metric = pool[name];
+        if (typeof metric === 'function') {
+            try {
+                return (metric as () => number).call(pool);
+            } catch {
+                return undefined;
             }
-            cacheableResponse.complete = cacheableResponse.req.res.complete;
-        };
-        cacheableResponse.prependOnceListener('end', fix);
-        fix();
+        }
+        return undefined;
+    };
+    return {
+        used: readMetric('numUsed'),
+        free: readMetric('numFree'),
+        pendingAcquires: readMetric('numPendingAcquires'),
+        pendingCreates: readMetric('numPendingCreates')
+    };
+}
+
+export function getFetchRuntimeState(): {
+    configuredConcurrency: number;
+    effectiveConcurrency: number;
+    dbPoolMax: number;
+    isFetchingRound: boolean;
+    queueLength: number;
+    queueRunning: number;
+    inflightFeedCount: number;
+    lastDueFeedCount: number;
+    lastScheduledFeedCount: number;
+    lastDuplicateSkippedFeedCount: number;
+} {
+    return {
+        configuredConcurrency: concurrency,
+        effectiveConcurrency,
+        dbPoolMax: db_pool_max,
+        isFetchingRound,
+        queueLength: queue.length(),
+        queueRunning: queue.running(),
+        inflightFeedCount: inQueueSet.size,
+        lastDueFeedCount,
+        lastScheduledFeedCount,
+        lastDuplicateSkippedFeedCount
+    };
+}
+
+function logFetchBacklog(): void {
+    const state = getFetchRuntimeState();
+    if (
+        state.queueLength === 0 &&
+        state.queueRunning === 0 &&
+        state.inflightFeedCount === 0
+    ) {
+        return;
+    }
+
+    logger.info({
+        message: 'fetch backlog',
+        ...state,
+        ...getKnexPoolStats()
     });
 }
 
-async function handleErr(e: Messager, feed: Feed): Promise<void> {
+function reportKnexTimeoutError(
+    error: unknown,
+    feed?: Pick<Feed, 'feed_id' | 'url'>
+): void {
+    const knexError = getKnexTimeoutError(error);
+    if (!knexError) {
+        return;
+    }
+
+    const poolStats = getKnexPoolStats();
+    const extra = {
+        ...getFetchRuntimeState(),
+        ...poolStats,
+        feed_id: feed?.feed_id,
+        feed_url: feed?.url
+    };
+
+    logger.error({
+        message: 'Knex pool timeout while fetching feed',
+        type: 'db_timeout',
+        error: serializeError(knexError),
+        ...extra
+    });
+
+    if (config.sentry_dsn) {
+        Sentry.withScope((scope) => {
+            scope.setTag('error_type', 'db_timeout');
+            if (feed?.feed_id !== undefined) {
+                scope.setTag('feed_id', String(feed.feed_id));
+            }
+            if (feed?.url) {
+                scope.setTag('feed_url', feed.url);
+            }
+            scope.setExtras(extra);
+            Sentry.captureException(
+                knexError instanceof Error
+                    ? knexError
+                    : new Error(
+                          knexError.message || 'Knex pool timeout detected'
+                      )
+            );
+        });
+    }
+}
+
+async function handleErr(
+    e: Pick<Messenger, 'message'>,
+    feed: Feed
+): Promise<void> {
     logger.info(`${feed.feed_title} ${feed.url}`, 'ERROR_MANY_TIME');
     const message: ErrorMaxTimeMessage = {
         success: false,
@@ -57,202 +222,288 @@ async function handleErr(e: Messager, feed: Feed): Promise<void> {
         feed
     };
     process.send && process.send(message);
-    const { origin } = new URL(feed.url);
-    const res = await got(origin);
-    const newUrl = await findFeed(res.body, origin);
-    delete res.body;
-    delete res.rawBody;
-    if (newUrl.length > 0) {
-        updateFeedUrl(feed.url, newUrl[0]);
-        const message: ChangeFeedUrlMessage = {
-            success: false,
-            message: 'CHANGE',
-            new_feed: newUrl,
-            err: { message: e.message },
-            feed: feed
-        };
-        process.send(message);
+    try {
+        const { origin } = new URL(feed.url);
+        const res = await got(origin);
+        const text = await res.textConverted();
+        const newUrl = await findFeed(text, origin);
+        if (newUrl.length > 0) {
+            await handleRedirect(feed.url, newUrl[0]);
+            const message: ChangeFeedUrlMessage = {
+                success: false,
+                message: 'CHANGE',
+                new_feed: newUrl,
+                err: { message: e.message },
+                feed: feed
+            };
+            process.send && process.send(message);
+        }
+    } catch (err) {
+        logger.error(`handlerError: ${err.stack ?? err.message}`);
     }
 }
 
-async function fetch(feedModal: Feed): Promise<Option<any[]>> {
-    const feedUrl = feedModal.url;
-    try {
-        logger.debug(`fetching ${feedUrl}`);
-        const requestUrl = encodeUrl(feedUrl);
-        const request = got.get(requestUrl, {
-            headers: {
-                'If-None-Match': feedModal.etag_header,
-                'If-Modified-Since': feedModal.last_modified_header
-            }
-        });
-        if (config.http_cache) {
-            request.on('request', gotBugWorkaround);
-        }
-        const res = await request;
-        if (res.statusCode === 304) {
-            const updatedFeedModal: Partial<Feed> & { feed_id: number } = {
-                feed_id: feedModal.feed_id,
-                error_count: 0,
-                next_fetch_time: nextFetchTimeStr(
-                    feedModal.ttl || config['GAP_MINUTES']
-                )
-            };
-            updateFeed(updatedFeedModal);
-            return none;
-        }
-        if (requestUrl !== res.url && res.statusCode === 301) {
-            await handleRedirect(feedUrl, res.url);
-        }
-        const feed = await parseString(res.body);
-        const items = feed.items;
-        const ttlMinutes =
-            typeof feed.ttl === 'number' && !Number.isNaN(feed.ttl)
-                ? feed.ttl
-                : config['GAP_MINUTES'];
-        const updatedFeedModal: Partial<Feed> & { feed_id: number } = {
-            feed_id: feedModal.feed_id,
-            error_count: 0,
-            next_fetch_time: nextFetchTimeStr(ttlMinutes)
-        };
-        if (feed.title !== feedModal.feed_title) {
-            updatedFeedModal.feed_title = feed.title;
-        }
-        if (!Number.isNaN(feed.ttl) && feed.ttl !== feedModal.ttl) {
-            updatedFeedModal.ttl = feed.ttl;
-        }
-        if (res.headers['last-modified'] !== feedModal.last_modified_header) {
-            updatedFeedModal.last_modified_header =
-                res.headers['last-modified'];
-        }
-        const etag = Array.isArray(res.headers['etag'])
-            ? res.headers['etag'][0]
-            : res.headers['etag'];
-        if (etag !== feedModal.etag_header) {
-            updatedFeedModal.etag_header = etag || '';
-        }
-        await updateFeed(updatedFeedModal);
-        return Optional(
-            items.map((item) => {
-                const { link, title, id } = item;
-                return { link, title, id };
-            })
-        );
-    } catch (e) {
-        logHttpError(feedUrl, e);
-        await failAttempt(feedUrl);
-        const feed = await getFeedByUrl(feedUrl);
-        if (isSome(feed)) {
-            const round_time = notify_error_count * 10;
-            const round_happen =
-                feed.value.error_count % round_time === 0 &&
-                feed.value.error_count > round_time;
-            if (feed.value.error_count === notify_error_count || round_happen) {
-                handleErr(e, feed.value);
-            }
+async function recordFetchFailure(error: unknown, feedUrl: string) {
+    logHttpError(feedUrl, error);
+    const feed = await failAttempt(feedUrl);
+    if (isSome(feed)) {
+        const count = feed.value.error_count;
+        const repeatInterval = notify_error_count * 10;
+        if (
+            count === notify_error_count ||
+            (count > repeatInterval && count % repeatInterval === 0)
+        ) {
+            await handleErr(error as Messenger, feed.value);
         }
     }
     return none;
 }
 
-const queue = new DiskFastq<never, Feed>(
-    async (eachFeed: Feed, cb) => {
-        const oldHashList = JSON.parse(eachFeed.recent_hash_list);
-        let fetchedItems: Option<FeedItem[]>;
-        try {
-            fetchedItems = await fetch(eachFeed);
-            if (isNone(fetchedItems)) {
-                cb(undefined, undefined);
-            } else {
-                const [sendItems, newHashList] = await getNewItems(
-                    oldHashList,
-                    fetchedItems.value
-                );
-                if (sendItems.length > 0) {
-                    await updateHashList(eachFeed.feed_id, newHashList);
-                }
-                cb(null, sendItems);
+export async function fetch(feedModal: Feed): Promise<Option<FeedItem[]>> {
+    const feedUrl = feedModal.url;
+    logger.debug(`fetching ${feedUrl}`);
+    let requestUrl: string;
+    let res: Awaited<ReturnType<typeof got>>;
+    try {
+        requestUrl = encodeUrl(feedUrl);
+        res = await got(requestUrl, {
+            headers: {
+                'If-None-Match': feedModal.etag_header,
+                'If-Modified-Since': feedModal.last_modified_header
             }
-        } catch (e) {
-            cb(e, undefined);
-        }
-    },
-    concurrency,
-    { filePath: path.join(config['PKG_ROOT'], 'data', 'job-queue') },
-    (err, sendItems, feed) => {
-        if (sendItems && !err) {
-            process.send &&
-                sendItems &&
-                process.send({
-                    success: true,
-                    sendItems: sendItems.slice(0, item_num),
-                    feed
-                } as SuccessMessage);
-        }
+        });
+    } catch (error) {
+        return recordFetchFailure(error, feedUrl);
     }
-);
 
-const fetchAll = async (): Promise<void> => {
+    if (res.status === 304) {
+        await updateFeed({
+            feed_id: feedModal.feed_id,
+            error_count: 0,
+            next_fetch_time: nextFetchTimeStr(
+                feedModal.ttl || config['GAP_MINUTES']
+            )
+        });
+        return none;
+    }
+    if (requestUrl !== res.url && res.status === 301) {
+        await handleRedirect(feedUrl, res.url);
+    }
+
+    let feed: TRSS;
+    try {
+        feed = await parseString(await res.textConverted());
+    } catch (error) {
+        return recordFetchFailure(error, feedUrl);
+    }
+    const items = feed.items;
+    const ttlMinutes =
+        typeof feed.ttl === 'number' && !Number.isNaN(feed.ttl)
+            ? feed.ttl
+            : config['GAP_MINUTES'];
+    const updatedFeedModal: Partial<Feed> & { feed_id: number } = {
+        feed_id: feedModal.feed_id,
+        error_count: 0,
+        next_fetch_time: nextFetchTimeStr(ttlMinutes)
+    };
+    if (feed.title !== feedModal.feed_title) {
+        updatedFeedModal.feed_title = feed.title;
+    }
+    if (!Number.isNaN(feed.ttl) && feed.ttl !== feedModal.ttl) {
+        updatedFeedModal.ttl = feed.ttl;
+    }
+    const lastModifiedHeader = res.headers.get('last-modified');
+    if (lastModifiedHeader !== feedModal.last_modified_header) {
+        updatedFeedModal.last_modified_header = lastModifiedHeader;
+    }
+    const etag = res.headers.get('etag');
+    if (etag !== feedModal.etag_header) {
+        updatedFeedModal.etag_header = etag || '';
+    }
+    await updateFeed(updatedFeedModal);
+    return Optional(
+        items.map((item) => {
+            const { link, title, id } = item;
+            return { link, title, id } as FeedItem;
+        })
+    );
+}
+
+const queue = fastQueue(async (eachFeed: Feed, cb: QueueCallback) => {
+    const oldHashList = JSON.parse(eachFeed.recent_hash_list);
+    let fetchedItems: Option<FeedItem[]>;
+    try {
+        fetchedItems = await fetch(eachFeed);
+        if (isNone(fetchedItems)) {
+            cb(undefined, undefined);
+        } else {
+            const [sendItems, newHashList] = await getNewItems(
+                oldHashList,
+                fetchedItems.value
+            );
+            if (sendItems.length > 0) {
+                await updateHashList(eachFeed.feed_id, newHashList);
+            }
+            cb(null, sendItems);
+        }
+    } catch (e) {
+        reportKnexTimeoutError(e, eachFeed);
+        cb(e as Error, undefined);
+    }
+}, effectiveConcurrency);
+
+export async function fetchAll(): Promise<void> {
     process.send && process.send('start fetching');
     const allFeeds = await getAllFeeds(config.strict_ttl);
-    if (queue.length > allFeeds.length * 3) {
-        queue.reset();
-    }
-    allFeeds.forEach((feed) => queue.push(feed));
-};
-
-function run() {
-    fetchAll()
-        .then(() => logger.info('fetch a round'))
-        .catch((e) => {
-            logger.error(
-                `[Catch in all ${e.name}] ${e.url} ${e.statusCode} ${e.statusMessage}`
-            );
-            logger.debug(e);
-        });
-}
-function gc() {
-    const beforeGC = process.memoryUsage();
-    const gcStartTime = process.hrtime.bigint();
-    global.gc();
-    const afterGC = process.memoryUsage();
-    const gcEndTime = process.hrtime.bigint();
-    logger.info(
-        `heapUsedBefore: ${beforeGC.heapUsed} heapUsedAfter: ${
-            afterGC.heapUsed
-        } rssBefore: ${beforeGC.rss} rssAfater: ${afterGC.rss} costed ${
-            gcEndTime - gcStartTime
-        }`
-    );
-    setTimeout(gc, 3 * 60 * 1000);
-}
-gc();
-run();
-const rule = new RecurrenceRule();
-const unit = fetch_gap.substring(fetch_gap.length - 1);
-const gapNum = parseInt(fetch_gap.substring(0, fetch_gap.length - 1));
-const time_gaps = [];
-switch (unit) {
-    case 'h':
-        for (let i = 0; i < 24; i = i + gapNum) {
-            time_gaps.push(i);
+    let duplicateSkippedFeedCount = 0;
+    const scheduledFeeds = allFeeds.filter((feed) => {
+        if (inQueueSet.has(feed.feed_id)) {
+            duplicateSkippedFeedCount += 1;
+            return false;
         }
-        rule.hour = time_gaps;
-        logger.info('fetch every ' + gapNum + ' hour(s)');
-        break;
-    case 'm':
-    default:
-        for (let i = 0; i < 60; i = i + gapNum) time_gaps.push(i);
-        rule.minute = time_gaps;
-        logger.info('fetch every ' + gapNum + ' minutes');
-        break;
+        inQueueSet.add(feed.feed_id);
+        return true;
+    });
+    lastDueFeedCount = allFeeds.length;
+    lastScheduledFeedCount = scheduledFeeds.length;
+    lastDuplicateSkippedFeedCount = duplicateSkippedFeedCount;
+
+    logger.info({
+        message: 'fetch round scheduled',
+        dueFeedCount: allFeeds.length,
+        scheduledFeedCount: scheduledFeeds.length,
+        duplicateSkippedFeedCount,
+        ...getFetchRuntimeState(),
+        ...getKnexPoolStats()
+    });
+
+    if (scheduledFeeds.length === 0) {
+        return;
+    }
+
+    await new Promise<void>((resolve) => {
+        let remaining = scheduledFeeds.length;
+        const complete = () => {
+            remaining -= 1;
+            if (remaining === 0) {
+                resolve();
+            }
+        };
+
+        scheduledFeeds.forEach((feed) => {
+            queue.push(feed, (err, sendItems) => {
+                inQueueSet.delete(feed.feed_id);
+                if (sendItems && !err) {
+                    process.send &&
+                        process.send({
+                            success: true,
+                            sendItems: sendItems.slice(0, item_num),
+                            feed
+                        } as SuccessMessage);
+                }
+                complete();
+            });
+        });
+    });
 }
 
-scheduleJob(rule, run);
-process.on('SIGUSR2', () => {
-    logger.info(
-        `worker queue length: ${queue.fastq.length()}, ${
-            queue.queue.remainCount
-        } => ${queue.length} Running: ${(queue.fastq as any).running()}`
-    );
-});
+export async function run(): Promise<void> {
+    if (isFetchingRound) {
+        logger.info({
+            message: 'skip fetch round',
+            ...getFetchRuntimeState()
+        });
+        return;
+    }
+
+    isFetchingRound = true;
+    logger.info({
+        message: 'start fetch round',
+        ...getFetchRuntimeState()
+    });
+    try {
+        await fetchAll();
+        logger.info({
+            message: 'fetch round complete',
+            ...getFetchRuntimeState()
+        });
+    } catch (e) {
+        reportKnexTimeoutError(e);
+        logger.error({
+            message: 'fetch round failed',
+            error: serializeError(e),
+            ...getFetchRuntimeState()
+        });
+    } finally {
+        isFetchingRound = false;
+    }
+}
+
+function logWorkerMemory(): void {
+    logger.info({ message: 'fetch worker memory', ...process.memoryUsage() });
+}
+
+export function startFetchWorker(): void {
+    if (config.sentry_dsn) {
+        Sentry.init({
+            dsn: config.sentry_dsn,
+            integrations: [
+                Sentry.rewriteFramesIntegration({
+                    root: config['PKG_ROOT']
+                })
+            ],
+            tracesSampleRate: 0.5
+        });
+    }
+
+    logger.info({
+        message: 'fetch worker initialized',
+        configuredConcurrency: concurrency,
+        effectiveConcurrency,
+        dbPoolMax: db_pool_max
+    });
+    const backlogLogTimer = setInterval(logFetchBacklog, 30 * 1000);
+    backlogLogTimer.unref?.();
+
+    logWorkerMemory();
+    setInterval(logWorkerMemory, 3 * 60 * 1000).unref();
+    void run();
+    const rule = new RecurrenceRule();
+    const unit = fetch_gap.substring(fetch_gap.length - 1);
+    const gapNum = parseInt(fetch_gap.substring(0, fetch_gap.length - 1), 10);
+    const time_gaps = [];
+    switch (unit) {
+        case 'h':
+            for (let i = 0; i < 24; i = i + gapNum) {
+                time_gaps.push(i);
+            }
+            rule.hour = time_gaps;
+            logger.info('fetch every ' + gapNum + ' hour(s)');
+            break;
+        case 'm':
+        default:
+            for (let i = 0; i < 60; i = i + gapNum) time_gaps.push(i);
+            rule.minute = time_gaps;
+            logger.info('fetch every ' + gapNum + ' minutes');
+            break;
+    }
+
+    scheduleJob(rule, () => {
+        void run();
+    });
+    process.on('unhandledRejection', (reason, promise) => {
+        logger.error(`Unhandled Rejection at: ${promise} reason: ${reason}`);
+    });
+    process.on('SIGUSR2', () => {
+        logger.info(
+            `worker queue length: ${queue.length()},  Running: ${queue.running()}`
+        );
+    });
+    process.on('disconnect', () => {
+        process.exit();
+    });
+}
+
+if (require.main === module) {
+    startFetchWorker();
+}

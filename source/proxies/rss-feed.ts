@@ -1,16 +1,19 @@
+import { config } from '../config';
+import { nextFetchTimeStr } from '../utils/next-fetch-time';
 import { db } from '../database';
 import errors from '../utils/errors';
 import { Feed } from '../types/feed';
 import { Subscribe } from '../types/subscribe';
 import { isSome, Option, Optional, Some } from '../types/option';
 import { decodeUrl } from '../utils/urlencode';
+import arrayShuffle from '../utils/shuffle';
 
 export async function sub(
     userId: number,
     feedUrl: string,
     feedTitle: string,
     ttl = 0
-): Promise<string> {
+): Promise<'ok'> {
     feedUrl = decodeUrl(feedUrl);
     const feed = await db<Feed>('rss_feed').where('url', feedUrl).first();
     if (feed) {
@@ -31,18 +34,26 @@ export async function sub(
             throw errors.newCtrlErr('ALREADY_SUB');
         }
     } else {
-        const [feed_id] = await db('rss_feed').insert(
-            {
-                url: feedUrl,
-                feed_title: feedTitle,
-                ttl: ttl
-            },
-            'feed_id'
-        );
-        await db('subscribes').insert(
-            { feed_id, user_id: userId },
-            'subscribe_id'
-        );
+        await db.transaction(async (trx) => {
+            let [feed_id] = await db('rss_feed')
+                .insert(
+                    {
+                        url: feedUrl,
+                        feed_title: feedTitle,
+                        ttl: ttl
+                    },
+                    'feed_id'
+                )
+                .returning('feed_id')
+                .transacting(trx);
+            if (typeof feed_id === 'object') {
+                feed_id = feed_id.feed_id; // pg return object
+            }
+            await db('subscribes')
+                .insert({ feed_id, user_id: userId }, 'subscribe_id')
+                .transacting(trx);
+        });
+
         return 'ok';
     }
 }
@@ -71,9 +82,9 @@ export async function getFeedById(id: number): Promise<Feed> {
     }
 }
 
-export async function unsub(userId: number, feedId: number): Promise<void> {
+export async function unsub(userId: number, feedId: number): Promise<number> {
     try {
-        await db('subscribes')
+        return await db('subscribes')
             .where('feed_id', feedId)
             .andWhere('user_id', userId)
             .del();
@@ -84,14 +95,24 @@ export async function unsub(userId: number, feedId: number): Promise<void> {
 
 export async function getAllFeeds(ttl = true): Promise<Feed[]> {
     try {
-        let query = db('rss_feed').whereIn(
-            'feed_id',
-            db('subscribes').distinct('feed_id')
-        );
+        let query = db('rss_feed as rss').whereExists(function () {
+            this.select(1)
+                .from('subscribes as s')
+                .whereRaw('s.feed_id = rss.feed_id');
+        });
         if (ttl) {
             query = query.where('next_fetch_time', '<', db.fn.now());
+        } else {
+            query = query.where(function () {
+                this.where(
+                    'error_count',
+                    '<',
+                    config.notify_error_count
+                ).orWhere('next_fetch_time', '<', db.fn.now());
+            });
         }
-        const feeds = await query.orderByRaw('random()').select();
+        const feeds = await query.select();
+        arrayShuffle(feeds);
 
         return feeds;
     } catch (e) {
@@ -168,11 +189,34 @@ export async function updateFeed(
     }
 }
 
-export async function failAttempt(feedUrl: string): Promise<number> {
+export async function failAttempt(feedUrl: string): Promise<Option<Feed>> {
     try {
-        return await db('rss_feed')
+        const threshold = config.notify_error_count;
+        const gap = config['GAP_MINUTES'];
+        const now = Date.now();
+        const [feed] = await db<Feed>('rss_feed')
             .where('url', feedUrl)
-            .increment('error_count', 1);
+            .increment('error_count', 1)
+            .update({
+                next_fetch_time: db.raw(
+                    `CASE
+                        WHEN error_count + 1 >= ? THEN ?
+                        WHEN error_count + 1 >= ? THEN ?
+                        WHEN error_count + 1 >= ? THEN ?
+                        ELSE next_fetch_time
+                    END`,
+                    [
+                        threshold * 4,
+                        nextFetchTimeStr(gap * 8, now),
+                        threshold * 2,
+                        nextFetchTimeStr(gap * 4, now),
+                        threshold,
+                        nextFetchTimeStr(gap * 2, now)
+                    ]
+                )
+            })
+            .returning('*');
+        return Optional(feed);
     } catch (e) {
         throw errors.newCtrlErr('DB_ERROR', e);
     }
@@ -226,7 +270,7 @@ export async function getAllFeedsCount(): Promise<number> {
         const result = await db('subscribes')
             .countDistinct({ count: 'feed_id' })
             .first();
-        return parseInt(result.count);
+        return parseInt(result.count, 10);
     } catch (e) {
         throw errors.newCtrlErr('DB_ERROR', e);
     }

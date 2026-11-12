@@ -13,20 +13,23 @@ jobs:
 
         strategy:
             matrix:
-                node-version: [12.x, 14.x, 15.x, 16.x]
+                node-version: [22.x, 24.x, 26.x, 27.x]
 
         steps:
             - uses: actions/checkout@v1
             - name: Use Node.js ${{ matrix.node-version }}
-              uses: actions/setup-node@v1
+              uses: actions/setup-node@v4
               with:
-                  node-version: ${{ matrix.node-version }}
+                  # Include prereleases until Node 27 reaches its first stable release.
+                  node-version: ${{ matrix.node-version == '27.x' && '^27.0.0-0' || matrix.node-version }}
             - name: npm install, build, and test
               run: |
-                  npm i -g npm
                   npm cache clean --force
                   npm ci
                   npm run build
+                  npm run lint
                   npm test -- --forceExit #https://github.com/facebook/jest/issues/9982#issuecomment-758110298
               env:
                   CI: true
+            - name: Check spelling
+              uses: crate-ci/typos@master

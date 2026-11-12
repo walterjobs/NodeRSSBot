@@ -1,4 +1,6 @@
-import Telegraf from 'telegraf';
+import editResponse from './utils/edit-response';
+import { Telegraf } from 'telegraf';
+import { telegrafThrottler } from 'telegraf-throttler';
 import { fork } from 'child_process';
 import { join } from 'path';
 import * as pkg from '../package.json';
@@ -7,7 +9,7 @@ import logger from './utils/logger';
 import errors from './utils/errors';
 import i18n from './i18n';
 import { initDB } from './database';
-import cleanStack from 'clean-stack';
+import cleanStack from '@cjsa/clean-stack';
 import { replyKeyboard, changeLangCallback } from './controlers/language';
 import {
     getUrlById,
@@ -21,12 +23,20 @@ import {
 import importReply from './controlers/import-reply';
 import { config } from './config';
 import agent from './utils/agent';
-const { token, view_all, lang, item_num, db_path, not_send } = config;
+const {
+    token,
+    view_all,
+    lang,
+    item_num,
+    db_path,
+    not_send,
+    telegram_api_base
+} = config;
 
 import getUrl from './middlewares/get-url';
 import getUrlByTitle from './middlewares/get-url-by-title';
 import getFileLink from './middlewares/get-file-link';
-import sendError from './middlewares/send-error';
+import sendError, { handleErrors, processing } from './middlewares/send-error';
 import testUrl from './middlewares/test-url';
 import isAdmin from './middlewares/is-admin';
 import onlyPrivateChat from './middlewares/only-private-chat';
@@ -34,7 +44,7 @@ import subMultiUrl from './middlewares/sub-multi-url';
 import exportToOpml from './middlewares/export-to-opml';
 import importFromOpml from './middlewares/import-from-opml';
 import userAllowList from './middlewares/user_allow_list';
-import { MContext, Next } from './types/ctx';
+import { MContext, TNextFn } from './types/ctx';
 import twoKeyReply from './utils/two-key-reply';
 import {
     isChangeFeedUrl,
@@ -44,24 +54,31 @@ import {
 } from './types/message';
 import { migrateUser } from './proxies/users';
 import { encodeUrl } from './utils/urlencode';
+import {
+    buildErrorNotification,
+    buildFeedChangeNotification
+} from './utils/notification-messages';
 
 const bot = new Telegraf(token, {
     telegram: {
         // Telegram options
+        apiRoot: telegram_api_base, // Custom API Base
         agent: agent?.https // https.Agent instance, allows custom proxy, certificate, keep alive, etc.
     }
 });
 
-bot.catch((err: Error) => logger.error(cleanStack(err.stack) || err.message));
-
-// for handling command form group
-bot.telegram.getMe().then((botInfo) => {
-    bot.options.username = botInfo.username;
+bot.catch((err: Error) => {
+    logger.error(cleanStack(err.stack) || err.message);
 });
 
+const throttler = telegrafThrottler();
+
+if (config.enable_throttle) {
+    bot.use(throttler);
+}
 bot.use(userAllowList);
 
-bot.command('start', sendError, async (ctx: MContext) => {
+bot.command('start', sendError, async (ctx) => {
     const builder = [];
     const { lang } = ctx.state;
     builder.push(i18n[lang]['WELCOME']);
@@ -73,10 +90,10 @@ bot.command('start', sendError, async (ctx: MContext) => {
     builder.push(i18n[lang]['USB_ALL_USAGE']);
     builder.push(i18n[lang]['LANG_USAGE']);
     if (view_all) builder.push(i18n[lang]['VIEW_ALL_USAGE']);
-    await ctx.replyWithMarkdown(builder.join('\n'));
+    await editResponse(ctx, builder.join('\n'), { parse_mode: 'Markdown' });
 });
 
-bot.command('help', sendError, async (ctx: MContext) => {
+bot.command('help', sendError, async (ctx) => {
     const builder = [];
     const { lang } = ctx.state;
     builder.push(i18n[lang]['SUB_USAGE']);
@@ -90,12 +107,12 @@ bot.command('help', sendError, async (ctx: MContext) => {
     builder.push(
         `[https://github.com/fengkx/NodeRSSBot/blob/master/README.md](https://github.com/fengkx/NodeRSSBot/blob/master/README.md)`
     );
-    await ctx.replyWithMarkdown(builder.join('\n'));
+    await editResponse(ctx, builder.join('\n'), { parse_mode: 'Markdown' });
 });
 
 bot.command('sub', sendError, isAdmin, getUrl, testUrl, sub);
 
-bot.command('unsub', sendError, isAdmin, getUrl, unsub);
+bot.command('unsub', handleErrors, isAdmin, getUrl, processing, unsub);
 
 bot.command('unsubthis', sendError, isAdmin, getUrlByTitle, unsub);
 
@@ -107,7 +124,7 @@ bot.command('import', importReply);
 
 bot.on(
     'document',
-    async (ctx: MContext, next) => {
+    async (ctx, next) => {
         ctx.state.chat = await ctx.getChat();
         if (ctx.state.chat.type === 'private') {
             await next();
@@ -168,25 +185,25 @@ bot.command(
 bot.command('lang', sendError, isAdmin, replyKeyboard);
 
 bot.command(
-    'heath',
+    'health',
     sendError,
     onlyPrivateChat,
     isAdmin,
     getActiveFeedWithErrorCount
 );
 
-bot.action(/^CHANGE_LANG[\w_]+/, changeLangCallback);
+bot.action(/^CHANGE_LANG[\w_]+/, sendError, changeLangCallback);
 
 bot.hears(
     /(((https?:(?:\/\/)?)(?:[-;:&=+$,\w]+@)?[A-Za-z0-9.-]+|(?:www\.|[-;:&=+$,\w]+@)[A-Za-z0-9.-]+)((?:\/[+~%/.\w\-_]*)?\??(?:[-+=&;%@.\w_]*)#?(?:[.!/\\\w]*))?)/gm,
-    async (ctx: MContext, next: Next) => {
+    async (ctx, next: TNextFn) => {
         ctx.state.chat = await ctx.getChat();
         if (ctx.state.chat.type === 'private') {
             await next();
         }
     },
     async (ctx: MContext, next) => {
-        if (!ctx.message.text.startsWith('/')) {
+        if ('text' in ctx.message && !ctx.message.text.startsWith('/')) {
             await next();
         }
     },
@@ -194,26 +211,19 @@ bot.hears(
     subMultiUrl
 );
 
-bot.hears(/^\[(\d+)] (.+)/, sendError, isAdmin, getUrlById, unsub);
-
-bot.action(
-    'UNSUB_ALL_YES',
-    sendError,
+bot.hears(
+    /^\[(\d+)] (.+)/,
+    handleErrors,
+    (ctx, next) => processing(ctx, next, { removeKeyboard: true }),
     isAdmin,
-    unsubAll,
-    async (ctx: MContext, next) => {
-        const cb = ctx.callbackQuery;
-        // @ts-ignore
-        ctx.telegram.answerCbQuery(cb.id);
-        await next();
-    }
+    getUrlById,
+    unsub
 );
 
-bot.action('UNSUB_ALL_NO', async (ctx: MContext, next) => {
-    const cb = ctx.callbackQuery;
-    // @ts-ignore
-    ctx.telegram.answerCbQuery(cb.id, i18n[lang]['CANCEL']);
-    await ctx.telegram.deleteMessage(cb.message.chat.id, cb.message.message_id);
+bot.action('UNSUB_ALL_YES', sendError, isAdmin, unsubAll);
+
+bot.action('UNSUB_ALL_NO', sendError, async (ctx: MContext, next) => {
+    await editResponse(ctx, i18n[ctx.state.lang]['CANCEL']);
     await next();
 });
 
@@ -223,12 +233,10 @@ bot.action(
     onlyPrivateChat,
     async (ctx: MContext, next) => {
         const cb = ctx.callbackQuery;
-        ctx.state.viewallPage = parseInt(cb.data.split('_')[1]);
-        await ctx.telegram.deleteMessage(
-            cb.message.chat.id,
-            cb.message.message_id
-        );
-        await next();
+        if ('data' in cb) {
+            ctx.state.viewallPage = parseInt(cb.data.split('_')[1], 10);
+            await next();
+        }
     },
     viewAll
 );
@@ -239,14 +247,12 @@ bot.action(
     isAdmin,
     async (ctx: MContext, next) => {
         const cb = ctx.callbackQuery;
-        const splitedStr = cb.data.split('_');
-        if (splitedStr[1] === 'RAW') ctx.state.showRaw = true;
-        ctx.state.rssPage = parseInt(splitedStr[splitedStr.length - 1]);
-        await ctx.telegram.deleteMessage(
-            cb.message.chat.id,
-            cb.message.message_id
-        );
-        await next();
+        if ('data' in cb) {
+            const splitStr = cb.data.split('_');
+            if (splitStr[1] === 'RAW') ctx.state.showRaw = true;
+            ctx.state.rssPage = parseInt(splitStr[splitStr.length - 1], 10);
+            await next();
+        }
     },
     rss
 );
@@ -264,11 +270,11 @@ async function startFetchProcess(restartTime: number): Promise<void> {
         process.exit(1);
     }
     const fetchJS = join(__dirname, `utils/fetch.js`);
-    const execArgv = process.env.NODE_PRODUTION
-        ? ['--expose-gc']
-        : ['--inspect-brk=46209', '--expose-gc'];
     const child = fork(fetchJS, [], {
-        execArgv
+        execArgv: process.env.NODE_PRODUCTION ? [] : ['--inspect-brk=46209']
+    });
+    process.once('exit', () => {
+        child.kill(9);
     });
     child.on('message', function (message: Message | string) {
         if (typeof message === 'string') logger.info(message);
@@ -278,24 +284,17 @@ async function startFetchProcess(restartTime: number): Promise<void> {
         } else {
             if (isErrorMaxTime(message)) {
                 const { feed, err } = message;
-                send(
-                    bot,
-                    `${feed.feed_title}: <a href="${feed.url}">${feed.url}</a> <%=i18n['ERROR_MANY_TIME']%> ${err.message}`,
-                    feed
-                );
+                const [template, locals] = buildErrorNotification(feed, err);
+                send(bot, template, feed, locals);
             }
             if (isChangeFeedUrl(message)) {
                 const { feed, new_feed } = message;
-                const builder = [];
-                builder.push(
-                    `${feed.feed_title}: <a href="${encodeUrl(
-                        feed.url
-                    )}"></a> <%=i18n['ERROR_MANY_TIME']%>`
-                ); // feed is from database which not urlencoded
-                builder.push(`<b><%=i18n['FOUND_FEEDS']%></b>:`);
-                builder.push(...new_feed);
-                builder.push(`<%=i18n['FEED_CHANGE_TO']%> ${new_feed[0]}`);
-                send(bot, builder.join('\n'), feed);
+                const [template, locals] = buildFeedChangeNotification(
+                    feed,
+                    new_feed,
+                    encodeUrl
+                );
+                send(bot, template, feed, locals);
             }
         }
     });

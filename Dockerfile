@@ -1,19 +1,19 @@
-FROM node:16-alpine as ts-builder
+FROM node:24-alpine as ts-builder
 WORKDIR /app
 COPY . /app
-RUN npm i -g npm && npm ci --ignore-scripts && npm run build
+RUN npm ci --ignore-scripts && npm run build
 
-FROM node:16-alpine as dep-builder
+FROM node:24-alpine as dep-builder
 WORKDIR /app
 COPY package.json package-lock.json /app/
 COPY tools /app/tools
-RUN apk add --no-cache --update build-base python2 python3
+RUN apk add --no-cache --update build-base python3 py3-pip
 COPY --from=ts-builder /app/dist /app/dist
-RUN npm i -g npm && npm ci && node tools/minify-docker.js && sh tools/clean-nm.sh
+RUN npm ci && node tools/minify-docker.js && sh tools/clean-nm.sh
 
-FROM node:16-alpine as app
+FROM node:24-alpine as app
 WORKDIR /app
-ENV NODE_PRODUTION true
+ENV NODE_PRODUCTION true
 COPY data /app/data
 COPY logs /app/logs
 COPY package.json /app/package.json

@@ -1,23 +1,22 @@
 {
-  "name": "noderssbot",
-  "version": "0.10.1",
+  "name": "node_rssbot",
+  "version": "0.11.1",
   "description": "Another Telegram RSSBot in Node.js",
   "main": "dist/source",
   "engines": {
-    "node": "^14.13.1 || >=16.0.0",
+    "node": "^22.22.2 || ^24.15.0 || ^26.0.0",
     "npm": ">=7"
   },
   "scripts": {
-    "build": "del-cli dist && tsc && cpy source/template dist/source/template && cpy i18n dist/i18n",
-    "start": "cross-env NODE_PRODUTION=true node dist/source/index.js",
-    "start-withsnapshot": "cross-env NODE_PRODUTION=true node --heapsnapshot-signal=SIGUSR2 dist/source/index.js",
+    "build": "del-cli dist && tsc && node tools/copy-assets.mjs",
+    "start": "cross-env NODE_PRODUCTION=true node dist/source/index.js",
+    "start-withsnapshot": "cross-env NODE_PRODUCTION=true node --heapsnapshot-signal=SIGUSR2 dist/source/index.js",
     "start-docker": "node --heapsnapshot-signal=SIGUSR2 dist/source/index.js",
     "dev": "node $NODE_DEBUG_OPTIONS dist/source/index",
     "test": "cross-env RSSBOT_DB_PATH=test/test-data/test.db RSSBOT_TOKEN=1 npx jest --verbose",
-    "pretty-quick": "pretty-quick --staged",
     "format": "eslint \"source/**/*.{js,ts}\" --fix && prettier \"**/*.{js,ts,json,md}\" --write",
-    "lint": "eslint \"source/**/*.{js,ts}\" && prettier-check \"**/*.{js,ts,json,md}\" && npm run lint-lockfile",
-    "lint-lockfile": "npx lockfile-lint --path package-lock.json --allowed-hosts npm yarn --validate-https"
+    "lint": "eslint \"source/**/*.{js,ts}\" && prettier -c \"**/*.{js,ts,json,md}\" && npm run lint-lockfile",
+    "lint-lockfile": "npx lockfile-lint --path package-lock.json --allowed-hosts npm yarn github.com  --allowed-schemes \"https:\" \"git+https:\""
   },
   "pre-commit": [
     "lint",
@@ -37,53 +36,95 @@
   },
   "homepage": "https://github.com/fengkx/NodeRSSBot#readme",
   "dependencies": {
-    "camaro": "^6.1.0",
-    "clean-stack": "^3.0.1",
-    "cross-env": "^7.0.3",
-    "disk-fastq": "^0.1.9",
-    "ejs": "^3.1.6",
-    "env-var": "^7.0.1",
-    "escape-goat": "3.0.0",
-    "fastq": "^1.13.0",
-    "got-iconv": "^3.0.0-beta.0",
-    "js-yaml": "^4.1.0",
-    "knex": "^0.95.11",
-    "node-schedule": "^2.0.0",
-    "pg": "^8.7.1",
-    "quick-lru": "^5.1.1",
-    "socks-proxy-agent": "^6.1.0",
-    "sqlite3": "^5.0.2",
-    "telegraf": "^3.38.0",
+    "@cjsa/clean-stack": "^4.2.0",
+    "@sentry/node": "^11.12.0",
+    "async-sema": "^3.1.1",
+    "camaro": "^6.7.3",
+    "cross-env": "^10.1.0",
+    "ejs": "^7.0.2",
+    "env-var": "^7.5.0",
+    "fast-escape-html": "^1.1.0",
+    "fastq": "^1.20.3",
+    "iconv-lite": "^0.7.3",
+    "js-yaml": "^5.5.0",
+    "knex": "^3.3.0",
+    "make-fetch-happen": "^16.0.1",
+    "node-schedule": "^2.1.2",
+    "pg": "^8.23.1",
+    "socks-proxy-agent": "^10.1.0",
+    "sqlite3": "^6.0.1",
+    "telegraf": "^4.16.3",
+    "telegraf-throttler": "^0.6.0",
     "tunnel": "0.0.6",
-    "winston": "^3.3.3",
-    "winston-daily-rotate-file": "^4.5.5"
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0"
   },
   "devDependencies": {
-    "@types/ejs": "^3.1.0",
-    "@types/jest": "^27.0.2",
-    "@types/js-yaml": "^4.0.3",
-    "@types/node-schedule": "^1.3.2",
-    "@types/tunnel": "^0.0.3",
-    "@typescript-eslint/eslint-plugin": "^4.32.0",
-    "@typescript-eslint/parser": "^4.33.0",
-    "@vercel/nft": "^0.17.0",
-    "cpy": "^8.1.2",
-    "cpy-cli": "^3.1.1",
-    "del-cli": "^4.0.1",
-    "eslint": "^7.32.0",
-    "eslint-plugin-import": "^2.25.3",
-    "jest": "^27.2.4",
-    "lockfile-lint": "^4.6.1",
-    "nock": "^13.1.3",
-    "pre-commit": "^1.2.2",
-    "prettier": "^2.4.1",
-    "prettier-check": "^2.0.0",
-    "pretty-quick": "^3.1.1",
-    "ts-jest": "^27.0.5",
-    "ts-node": "^10.4.0",
-    "typescript": "^4.4.3"
+    "@eslint/js": "^10.0.1",
+    "@types/create-test-server": "^3.0.5",
+    "@types/ejs": "^3.1.5",
+    "@types/jest": "^30.0.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/make-fetch-happen": "^10.0.4",
+    "@types/node": "^26.6.6",
+    "@types/node-schedule": "^2.1.8",
+    "@types/tunnel": "^0.0.7",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "@vercel/nft": "^1.11.1",
+    "create-test-server": "^3.0.1",
+    "del-cli": "^8.0.1",
+    "eslint": "^10.14.0",
+    "globals": "^17.14.0",
+    "jest": "^30.5.2",
+    "lockfile-lint": "^5.1.0",
+    "pre-commit": "^2.0.0",
+    "prettier": "^3.10.0",
+    "ts-jest": "^29.4.15",
+    "ts-node": "^10.9.2",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "typescript-eslint": "^8.72.2"
   },
   "jest": {
-    "preset": "ts-jest/presets/js-with-ts"
+    "openHandlesTimeout": 0,
+    "preset": "ts-jest/presets/js-with-ts",
+    "modulePathIgnorePatterns": [
+      "<rootDir>/dist/"
+    ],
+    "setupFiles": [
+      "<rootDir>/test/jest.setup-env.cjs"
+    ],
+    "transform": {
+      "^.+\\.[tj]s$": [
+        "ts-jest",
+        {
+          "tsconfig": "tsconfig.test.json"
+        }
+      ]
+    },
+    "coveragePathIgnorePatterns": [
+      "<rootDir>/test/test-data/*"
+    ],
+    "transformIgnorePatterns": [
+      "/node_modules/(?!(?:.*/node_modules/)?(?:https?-proxy-agent|socks-proxy-agent|proxy-agent-negotiate|agent-base)/)"
+    ]
+  },
+  "overrides": {
+    "has": "npm:@nolyfill/has@^1.0.44",
+    "is-core-module": "npm:@nolyfill/is-core-module@^1.0.39",
+    "isarray": "npm:@nolyfill/isarray@^1.0.44",
+    "make-fetch-happen": "$make-fetch-happen",
+    "create-test-server": {
+      "create-cert": {
+        "pem": "^1.14.8"
+      }
+    },
+    "side-channel": "npm:@nolyfill/side-channel@^1.0.44",
+    "typedarray": "npm:@nolyfill/typedarray@^1.0.44"
+  },
+  "allowScripts": {
+    "nice-napi@1.0.2": true,
+    "pre-commit@2.0.0": true,
+    "sqlite3@6.0.1": true,
+    "unrs-resolver@1.11.1": true
   }
 }

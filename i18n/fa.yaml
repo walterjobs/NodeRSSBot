@@ -16,7 +16,7 @@ UNSUB_SUCCESS: لغو اشتراک با موفقیت انجام شد
 NOT_SUB: فیدی را مشترک نشده‌اید
 SUB_LIST: اشتراک‌ها
 ERROR_MANY_TIME: خطا در دریافت اطلاعات برای چندبار، شاید بخواهید لغواشتراک کنید
-OPML_PARSE_ERRO: خطا در تجزیه opml
+OPML_PARSE_ERROR: خطا در تجزیه opml
 NETWORK_ERROR: خطای شبکه
 IMPORT_SUCCESS: با موفقیت وارد شد
 FILESYSTEM_ERROR: خطای FileSystem
@@ -51,3 +51,5 @@ ACTIVE_FEED_COUNT_WITH_ERROR: تعداد فیدهای فعال با خطا
 TOTAL_ACTIVE_FEED_COUNT: تعداد فیدهای فعال
 CREATOR_ONLY: فقط سازنده ربات
 ALLOW_LIST_NOT_INCLUDE: این ربات لیست مجاز را فعال کرده است و شما مسدود شده اید
+EXPORT_SUCCESS: با موفقیت صادر شد
+RESPONSE_TOO_LONG: نتیجه برای نمایش بیش از حد طولانی است.

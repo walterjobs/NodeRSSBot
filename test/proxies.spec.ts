@@ -41,7 +41,7 @@ test('RSS getAllFeeds', async () => {
 
 test('RSS updateFeed', async () => {
     const feed = (await RSS.getFeedByUrl(feedUrl)) as Some<Feed>;
-    RSS.updateFeed({
+    await RSS.updateFeed({
         feed_id: feed.value.feed_id,
         next_fetch_time: '3000-01-01'
     });
@@ -85,7 +85,8 @@ test('RSS updateHashList', async () => {
 });
 
 test('RSS unsub', async () => {
-    await RSS.unsub(userId, 1);
+    expect(await RSS.unsub(userId, 1)).toBe(1);
+    expect(await RSS.unsub(userId, 1)).toBe(0);
     // subscription deleted
     const subscribe = await SUBSCRIBES.getSubscribersByFeedId(1);
     expect(subscribe).toHaveProperty('length', 0);

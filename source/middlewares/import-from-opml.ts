@@ -1,30 +1,37 @@
+import { MESSAGE_LIMIT } from '../utils/limit-text';
+import editResponse from '../utils/edit-response';
 import { Outline } from '../types/outline';
 import got from '../utils/got';
 import { transform } from 'camaro';
 import errors from '../utils/errors';
 import { sub } from '../proxies/rss-feed';
 import i18n from '../i18n';
-import { MContext, Next } from '../types/ctx';
+import { MContext, TNextFn } from '../types/ctx';
+import sanitize from '../utils/sanitize';
+import escapeHtml from '../utils/escape-html';
 
 const getOutlines = async function (data: string): Promise<Outline[]> {
-    return await transform(data, [
-        '//outline[@type="rss"]',
-        {
-            xmlUrl: '@xmlUrl',
-            type: '@type',
-            text: '@text'
-        }
-    ]);
+    const { outlines } = await transform(data, {
+        outlines: [
+            '//outline[@type="rss"]',
+            {
+                xmlUrl: '@xmlUrl',
+                type: '@type',
+                text: '@text'
+            }
+        ]
+    } as const);
+    return outlines;
 };
 
-// eslint-disable-line
 export const _getOutlines = getOutlines;
-export default async (ctx: MContext, next: Next): Promise<void> => {
+export default async (ctx: MContext, next: TNextFn): Promise<void> => {
     const { fileLink, lang } = ctx.state;
 
+    let text: string;
     try {
-        const res = await got.get(fileLink);
-        const opmlStr = res.body;
+        const res = await got(fileLink);
+        const opmlStr = await res.textConverted();
         const outlines = await getOutlines(opmlStr);
         ctx.state.outlines = outlines;
         await Promise.all(
@@ -38,24 +45,23 @@ export default async (ctx: MContext, next: Next): Promise<void> => {
                 }
             })
         );
-        let text = `<strong>${i18n[lang]['IMPORT_SUCCESS']}</strong>`;
+        text = `<strong>${i18n[lang]['IMPORT_SUCCESS']}</strong>`;
         outlines.forEach((outline) => {
-            text += `\n<a href="${outline.xmlUrl}">${outline.text}</a>`;
+            // URL is escaped for href, title text is sanitized for display
+            text += `\n<a href="${escapeHtml(outline.xmlUrl)}">${sanitize(outline.text)}</a>`;
         });
-        if (text.length > 4096) {
+        if (text.length > MESSAGE_LIMIT) {
             text = `<strong>${i18n[lang]['IMPORT_SUCCESS']}</strong>\n`;
         }
-        ctx.telegram.deleteMessage(ctx.state.chat.id, ctx.state.processMsgId);
-        ctx.state.processMsgId = null;
-        ctx.replyWithHTML(text);
     } catch (e) {
         if (e.response) {
             throw errors.newCtrlErr('NETWORK_ERROR', e);
         } else if (e instanceof errors.ControllableError) {
             throw e;
         } else {
-            throw errors.newCtrlErr('OPML_PARSE_ERRO', e);
+            throw errors.newCtrlErr('OPML_PARSE_ERROR', e);
         }
     }
+    await editResponse(ctx, text, { parse_mode: 'HTML' });
     await next();
 };

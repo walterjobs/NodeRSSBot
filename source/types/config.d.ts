@@ -1,5 +1,6 @@
 export type Config = {
     token: string;
+    telegram_api_base: string;
     proxy: {
         protocol: string;
         host: string;
@@ -16,9 +17,14 @@ export type Config = {
     UA: string;
     not_send: boolean;
     concurrency: number;
+    send_concurrency: number;
+    send_rate: number;
+    db_pool_max: number;
     delete_on_err_send: boolean;
     resp_timeout: number;
-    before_resp_timeout: number;
     allow_list: number[] | null;
     auto_migrate: boolean;
+    sentry_dsn?: string;
+    enable_throttle: boolean;
+    ['PKG_ROOT']: Readonly<string>;
 };
